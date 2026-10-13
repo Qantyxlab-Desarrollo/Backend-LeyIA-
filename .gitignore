@@ -1,0 +1,19 @@
+# El agente NO se sube (cubre ambas capitalizaciones)
+LeyIA/
+leyia/
+
+# secretos y basura
+.env
+__pycache__/
+*.pyc
+.venv/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+credentials.json
+token.json
+
+venv/
+env/
+*.egg-info/
+.pytest_cache/

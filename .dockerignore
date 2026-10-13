@@ -1,0 +1,8 @@
+.git
+.gitignore
+.env
+__pycache__/
+*.pyc
+.venv/
+*.sqlite
+leyia/            # el agente NO entra a la imagen del backend
