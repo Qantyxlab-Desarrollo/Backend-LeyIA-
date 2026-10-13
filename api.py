@@ -78,12 +78,13 @@ app = FastAPI(
 )
 
 ALLOWED_ORIGINS = [
-    settings.FRONTEND_URL,                          # principal (variable)
-    "https://frontend-leyia.vercel.app",            # dominio Vercel actual
-    "https://app.leyia.com",                        # futuro dominio custom
+    settings.FRONTEND_URL,
+    "https://frontend-ley-ia.vercel.app",   # ✅ con guion
+    "https://app.leyia.com",
     "http://localhost:5173", "http://127.0.0.1:5173",
     "http://localhost:3000", "http://127.0.0.1:3000",
 ]
+
 
 app.add_middleware(
     CORSMiddleware,
