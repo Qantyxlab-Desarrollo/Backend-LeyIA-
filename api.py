@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # api.py — LeyIA Central (portal multi-tenant)
-# v3.0.0 — Auth central + tenancy + métricas por tenant + provisión admin
+# v3.1.0 — Auth central + tenancy + métricas por tenant (capa semantic v2)
+#          + refresco programado de matviews (b_mensajes/b_sesiones/b_clientes)
 # Un despliegue = TODOS los clientes.
 # SIN agente, SIN webhook WhatsApp (eso vive en agent_api.py, por cliente).
 
@@ -73,13 +74,13 @@ from routes.public_routes import router as public_router    # branding por tenan
 
 app = FastAPI(
     title="LeyIA Central",
-    version="3.0.0",
-    description="API central multi-tenant: identidad, autorización y métricas.",
+    version="3.1.0",
+    description="API central multi-tenant: identidad, autorización y métricas (capa semantic v2).",
 )
 
 ALLOWED_ORIGINS = [
     settings.FRONTEND_URL,
-    "https://frontend-ley-ia.vercel.app",   # ✅ con guion
+    "https://frontend-ley-ia.vercel.app",
     "https://app.leyia.com",
     "http://localhost:5173", "http://127.0.0.1:5173",
     "http://localhost:3000", "http://127.0.0.1:3000",
@@ -89,7 +90,7 @@ ALLOWED_ORIGINS = [
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
-    allow_credentials=True,   # necesario para la cookie httpOnly
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -151,9 +152,14 @@ async def system_status():
     return {
         "status": "ok",
         "service": "central",
-        "version": "3.0.0",
+        "version": "3.1.0",
         "environment": settings.ENVIRONMENT,
         "dev_bypass": settings.dev_tenant_bypass_enabled,
+        "capa_datos": "semantic v2 (b_mensajes/b_sesiones/b_clientes)",
+        "refresco_matviews": (
+            "loop_backend_dev" if settings.dev_tenant_bypass_enabled
+            else "pg_cron_o_admin_endpoint"
+        ),
     }
 
 
@@ -194,9 +200,8 @@ async def lifespan(app: FastAPI):
     logger.info(f"🟢 Rutas /api: {len([r for r in _list_api_routes() if r['path'].startswith('/api')])}")
     logger.info("=" * 70)
 
-    # Warm-up SOLO en desarrollo: calienta pool + caché del tenant demo.
-    # En producción el pool de cada tenant se crea lazy en su primer request.
     if settings.dev_tenant_bypass_enabled:
+        # ---- Warm-up del pool del tenant demo ----
         async def _warmup():
             try:
                 from auth.tenancy import _dev_context
@@ -209,7 +214,31 @@ async def lifespan(app: FastAPI):
 
         asyncio.create_task(_warmup())
 
+        # ---- NUEVO: loop de refresco de matviews (solo entorno con bypass) ----
+        # En producción el refresco queda a cargo de pg_cron en la BD del tenant
+        # (recomendado) o del endpoint POST /api/dashboard/admin/refresh-matviews
+        # invocado por un scheduler externo.
+        try:
+            from auth.tenancy import _dev_context
+            from services.mview_refresh_service import start_refresh_loop
+            start_refresh_loop(_dev_context())
+            logger.info("♻️ Loop de refresco de matviews INICIADO (dev)")
+        except Exception as e:
+            logger.warning(f"⚠️ No se pudo iniciar el loop de refresco (no fatal): {e}")
+    else:
+        logger.info(
+            "ℹ️ Refresco de matviews (producción): pg_cron por tenant "
+            "o POST /api/dashboard/admin/refresh-matviews"
+        )
+
     yield
+
+    # ---- Shutdown ordenado ----
+    try:
+        from services.mview_refresh_service import stop_refresh_loop
+        await stop_refresh_loop()
+    except Exception:
+        pass
 
     from core.tenant_db import close_tenant_pools
     from database.connection import close_all_connections
