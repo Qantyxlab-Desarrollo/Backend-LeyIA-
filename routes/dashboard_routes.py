@@ -17,6 +17,7 @@ from services.dashboard_service import (
     get_agendas_detalle_service,
     get_agendas_total_service,
     get_citas_diarias_service,
+    get_proximas_citas_service,
     get_escalaciones_service,
     get_ttr_bot_diario_service,
     get_ttr_bot_total_service,
@@ -119,6 +120,25 @@ async def citas_diarias(
     tenant: TenantContext = Depends(get_tenant_context),
 ):
     return await get_citas_diarias_service(tenant, fecha_inicio, fecha_fin, modalidad)
+
+
+# ============================================================================
+# 2c. PRÓXIMAS CITAS — lectura directa de la tabla bookings
+# ============================================================================
+
+@router.get("/citas/proximas", response_model=Dict[str, Any])
+async def citas_proximas(
+    fecha_inicio: Optional[date] = Query(None, description="Por defecto hoy. Puedes poner una fecha pasada si lo necesitas."),
+    fecha_fin: Optional[date] = Query(None),
+    modalidad: Optional[str] = Query(None, description="'Presencial' | 'Online'"),
+    limite: int = Query(100, ge=1, le=500),
+    tenant: TenantContext = Depends(get_tenant_context),
+):
+    """
+    Próximas citas desde la tabla `bookings` (no la vista).
+    Devuelve totales, conteo por modalidad y citas agrupadas por día.
+    """
+    return await get_proximas_citas_service(tenant, fecha_inicio, fecha_fin, modalidad, limite)
 
 
 # ============================================================================

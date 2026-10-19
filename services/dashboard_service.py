@@ -4,10 +4,15 @@
 
 import asyncio
 import logging
+import traceback
+from collections import OrderedDict
+from datetime import date, datetime, time, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
+import asyncpg
+
 from auth.tenancy import TenantContext
-from core.tenant_db import tenant_cache, tenant_fetch, tenant_fetchrow
+from core.tenant_db import tenant_cache, tenant_fetch, tenant_fetchrow, tenant_fetch_raw, tenant_fetchrow_raw
 
 logger = logging.getLogger("leyia.dashboard")
 
@@ -15,6 +20,9 @@ TTL_TOTALS = 120.0
 TTL_SERIES = 120.0
 TTL_ESCALACIONES = 60.0
 TTL_RESUMEN = 120.0
+
+MESES_ES = ["ene", "feb", "mar", "abr", "may", "jun", "jul", "ago", "sep", "oct", "nov", "dic"]
+DIAS_ES = ["Lun", "Mar", "Mié", "Jue", "Vie", "Sáb", "Dom"]
 
 
 def _build_filters(
@@ -31,7 +39,7 @@ def _build_filters(
         params.append(fecha_fin)
         clauses.append(f"{campo_fecha} <= ${len(params)}")
     for columna, valor in (extras or {}).items():
-        if valor is None:
+        if valor is None or columna is None:
             continue
         params.append(valor)
         clauses.append(f"{columna} = ${len(params)}")
@@ -39,8 +47,40 @@ def _build_filters(
     return where, params
 
 
+def _parse_fecha_texto(fecha_raw) -> Optional[date]:
+    """Parsea fechas en formatos DD/MM/YYYY o YYYY-MM-DD."""
+    if not fecha_raw:
+        return None
+    if isinstance(fecha_raw, date) and not isinstance(fecha_raw, datetime):
+        return fecha_raw
+    if isinstance(fecha_raw, datetime):
+        return fecha_raw.date()
+    if not isinstance(fecha_raw, str):
+        return None
+
+    s = fecha_raw.strip()
+    for fmt in ("%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y", "%m/%d/%Y"):
+        try:
+            return datetime.strptime(s[:10], fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def _normalizar_modalidad(modalidad_raw) -> str:
+    """Normaliza modalidades con emojis a Online/Presencial."""
+    if not modalidad_raw:
+        return "Sin modalidad"
+    lower = str(modalidad_raw).lower()
+    if any(k in lower for k in ("online", "meet", "zoom", "videollamada", "virtual", "google meet")):
+        return "Online"
+    if any(k in lower for k in ("presencial", "oficina", "presencialmente")):
+        return "Presencial"
+    return str(modalidad_raw).strip()[:30] or "Sin modalidad"
+
+
 # ============================================================================
-# 1. CONVERSACIONES (sesiones analíticas)
+# 1. CONVERSACIONES
 # ============================================================================
 
 async def get_conversaciones_diarias_service(
@@ -132,7 +172,7 @@ async def get_agendas_total_service(tenant: TenantContext) -> Dict[str, Any]:
 
 
 # ============================================================================
-# 2b. CITAS (carga por día de ocurrencia)
+# 2b. CITAS (por día de ocurrencia)
 # ============================================================================
 
 async def get_citas_diarias_service(
@@ -155,7 +195,154 @@ async def get_citas_diarias_service(
 
 
 # ============================================================================
-# 3. ESCALACIONES (con motivo y split demanda real)
+# 2c. PRÓXIMAS CITAS — desde public.bookings de la BD del cliente
+# ============================================================================
+
+async def get_proximas_citas_service(
+    tenant: TenantContext,
+    fecha_inicio: Optional[date] = None,
+    fecha_fin: Optional[date] = None,
+    modalidad: Optional[str] = None,
+    limite: int = 100,
+) -> Dict[str, Any]:
+    """
+    Próximas citas desde public.bookings de la base de datos del cliente.
+    Usa el mismo mecanismo de conexión multi-tenant que el resto del dashboard
+    (core.tenant_db), leyendo directamente del esquema public.
+    """
+    hoy = date.today()
+
+    # 1. Query de bookings según modalidad
+    if modalidad:
+        query_sql = """
+            SELECT id, thread_id, lead_id, evento_id, fecha, hora_inicio, hora_fin,
+                   modalidad, meet_link, html_link, created_at, inicio_cita,
+                   cliente_nombre, cliente_email
+            FROM public.bookings
+            WHERE modalidad = $1
+            ORDER BY inicio_cita ASC
+        """
+        raw_rows = await tenant_fetch_raw(
+            tenant, query_sql, modalidad,
+            schema="public", label="proximas_citas_bookings"
+        )
+    else:
+        query_sql = """
+            SELECT id, thread_id, lead_id, evento_id, fecha, hora_inicio, hora_fin,
+                   modalidad, meet_link, html_link, created_at, inicio_cita,
+                   cliente_nombre, cliente_email
+            FROM public.bookings
+            ORDER BY inicio_cita ASC
+        """
+        raw_rows = await tenant_fetch_raw(
+            tenant, query_sql,
+            schema="public", label="proximas_citas_bookings"
+        )
+
+    # 2. Contar total en base del cliente
+    total_db = 0
+    try:
+        count_row = await tenant_fetchrow_raw(
+            tenant,
+            "SELECT COUNT(*)::int AS n FROM public.bookings",
+            schema="public", label="proximas_citas_count"
+        )
+        total_db = count_row.get("n", 0) if count_row else 0
+    except Exception:
+        pass
+
+    # 3. Parsear y normalizar filas
+    rows: List[Dict[str, Any]] = []
+    for r in raw_rows:
+        fecha_date = _parse_fecha_texto(r.get("fecha"))
+        inicio_cita = r.get("inicio_cita")
+        hora_inicio = None
+
+        if isinstance(inicio_cita, datetime):
+            hora_inicio = inicio_cita.strftime("%H:%M")
+            if not fecha_date:
+                fecha_date = inicio_cita.date()
+        else:
+            hora_raw = r.get("hora_inicio")
+            hora_inicio = hora_raw[:5] if isinstance(hora_raw, str) and len(hora_raw) >= 5 else hora_raw
+
+        if not fecha_date:
+            continue
+
+        rows.append({
+            "id": r.get("id"),
+            "thread_id": r.get("thread_id"),
+            "lead_id": r.get("lead_id"),
+            "evento_id": r.get("evento_id"),
+            "fecha_cita": fecha_date,
+            "hora": hora_inicio,
+            "hora_fin": r.get("hora_fin"),
+            "cliente_nombre": r.get("cliente_nombre"),
+            "cliente_email": r.get("cliente_email"),
+            "modalidad": _normalizar_modalidad(r.get("modalidad")),
+            "modalidad_original": r.get("modalidad") or "Sin modalidad",
+            "meet_link": r.get("meet_link"),
+            "html_link": r.get("html_link"),
+            "created_at": r.get("created_at"),
+            "inicio_cita": inicio_cita,
+        })
+
+    # 4. Filtrar por rango de fechas
+    fecha_desde = fecha_inicio or hoy
+    fecha_hasta = fecha_fin
+
+    rows_filtradas = [
+        r for r in rows
+        if r["fecha_cita"] >= fecha_desde
+        and (not fecha_hasta or r["fecha_cita"] <= fecha_hasta)
+    ]
+
+    fallback_used = False
+    if not rows_filtradas and not fecha_inicio and not fecha_fin:
+        fallback_used = True
+        rows_filtradas = [r for r in rows if r["fecha_cita"]]
+
+    rows_filtradas.sort(key=lambda x: (x["fecha_cita"], x["hora"] or ""))
+    rows_filtradas = rows_filtradas[:limite]
+
+    total = len(rows_filtradas)
+    online = sum(1 for r in rows_filtradas if r["modalidad"] == "Online")
+    presencial = sum(1 for r in rows_filtradas if r["modalidad"] == "Presencial")
+
+    # 5. Agrupar por día
+    dias: "OrderedDict[date, Dict[str, Any]]" = OrderedDict()
+    for r in rows_filtradas:
+        fc = r["fecha_cita"]
+        if fc not in dias:
+            dias[fc] = {
+                "fecha": fc.isoformat(),
+                "fecha_cita": fc,
+                "dia_semana": DIAS_ES[fc.weekday()],
+                "dia": fc.day,
+                "mes": MESES_ES[fc.month - 1],
+                "modalidad_resumen": {},
+                "total_dia": 0,
+                "citas": [],
+            }
+        dia = dias[fc]
+        mod = r["modalidad"]
+        dia["modalidad_resumen"][mod] = dia["modalidad_resumen"].get(mod, 0) + 1
+        dia["total_dia"] += 1
+        dia["citas"].append(dict(r))
+
+    return {
+        "total_citas": total,
+        "online": online,
+        "presencial": presencial,
+        "orden": "cronologico",
+        "fecha_inicio": fecha_inicio.isoformat() if fecha_inicio else hoy.isoformat(),
+        "fecha_fin": fecha_fin.isoformat() if fecha_fin else None,
+        "por_dia": list(dias.values()),
+    }
+
+
+# ============================================================================
+# 3. ESCALACIONES
 # ============================================================================
 
 async def get_escalaciones_service(
@@ -187,7 +374,7 @@ async def get_escalaciones_service(
 
 
 # ============================================================================
-# 4. TTR DEL BOT (honesto: p50/p95)
+# 4. TTR DEL BOT (p50/p95)
 # ============================================================================
 
 async def get_ttr_bot_diario_service(
@@ -265,7 +452,7 @@ async def get_conversion_agenda_total_service(tenant: TenantContext) -> Dict[str
 
 
 # ============================================================================
-# 6. NUEVO — NEGOCIO
+# 6. NEGOCIO
 # ============================================================================
 
 async def get_funnel_semanal_service(tenant: TenantContext, semanas: int = 12) -> List[Dict[str, Any]]:
