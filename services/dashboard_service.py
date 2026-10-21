@@ -345,33 +345,50 @@ async def get_proximas_citas_service(
 # 3. ESCALACIONES
 # ============================================================================
 
+# ============================================================================
+# 3. ESCALACIONES (public.escalations)
+# ============================================================================
+
 async def get_escalaciones_service(
     tenant: TenantContext,
     limite: int = 100,
     solo_no_notificados: bool = False,
-    solo_demanda_real: bool = False,
+    dias: int = 1,  # 1 = hoy, 7 = últimos 7 días, 30 = últimos 30 días
 ) -> List[Dict[str, Any]]:
-    condiciones, params = [], []
+    """
+    Devuelve escalaciones desde public.escalations del tenant.
+    Por defecto filtra solo las de hoy (desde 00:00).
+    """
+    if dias < 1:
+        dias = 1
+
+    condiciones = [f"created_at >= (CURRENT_DATE - INTERVAL '{dias - 1} days')"]
+    params: List[Any] = []
+
     if solo_no_notificados:
-        condiciones.append("notificado_whatsapp = FALSE")
-    if solo_demanda_real:
-        condiciones.append("es_demanda_real = TRUE")
-    where = f" WHERE {' AND '.join(condiciones)}" if condiciones else ""
+        params.append(False)
+        condiciones.append(f"notificado_whatsapp = ${len(params)}")
+
     params.append(limite)
+
+    where = " WHERE " + " AND ".join(condiciones)
+
     query = f"""
         SELECT id, thread_id, conversation_id, lead_id, summary,
-               notificado_whatsapp, notificado_wsp, created_at, motivo, es_demanda_real
-        FROM semantic.v_escalaciones
+               notificado_whatsapp, created_at, motivo
+        FROM public.escalations
         {where}
         ORDER BY created_at DESC
         LIMIT ${len(params)}
     """
-    key = f"escalaciones:{limite}:{solo_no_notificados}:{solo_demanda_real}"
+
+    key = f"escalaciones:{limite}:{solo_no_notificados}:{dias}"
     return await tenant_cache.get_or_set(
         tenant, key,
-        lambda: tenant_fetch(tenant, query, *params, schema="semantic", label="escalaciones")
+        lambda: tenant_fetch_raw(
+            tenant, query, *params, schema="public", label="escalaciones"
+        )
     )
-
 
 # ============================================================================
 # 4. TTR DEL BOT (p50/p95)
@@ -554,16 +571,13 @@ async def get_dashboard_resumen_service(tenant: TenantContext) -> Dict[str, Any]
             _safe(get_agendas_total_service(tenant), "agendas"),
             _safe(get_ttr_bot_total_service(tenant), "ttr"),
             _safe(get_conversion_agenda_total_service(tenant), "conversion"),
-            _safe(tenant_fetchrow(
+            _safe(tenant_fetchrow_raw(
                 tenant,
                 "SELECT COUNT(*)::int AS escalaciones_sin_notificar "
-                "FROM semantic.v_escalaciones WHERE notificado_whatsapp = FALSE",
-                schema="semantic", label="esc_sin_notificar"), "esc_pendientes"),
-            _safe(tenant_fetchrow(
-                tenant,
-                "SELECT COUNT(*)::int AS escalaciones_demanda_real "
-                "FROM semantic.v_escalaciones WHERE es_demanda_real",
-                schema="semantic", label="esc_demanda"), "esc_demanda"),
+                "FROM public.escalations "
+                "WHERE notificado_whatsapp = FALSE "
+                "  AND created_at >= CURRENT_DATE",
+                schema="public", label="esc_sin_notificar"), "esc_pendientes"),
             _safe(_funnel_ultima_semana(tenant), "funnel"),
         )
         merged: Dict[str, Any] = {}
@@ -572,6 +586,7 @@ async def get_dashboard_resumen_service(tenant: TenantContext) -> Dict[str, Any]
         return merged
 
     return await tenant_cache.get_or_set(tenant, "resumen", _compute)
+
 
 
 # ============================================================================
