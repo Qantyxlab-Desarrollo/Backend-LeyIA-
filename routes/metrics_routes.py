@@ -4,7 +4,8 @@
 from fastapi import APIRouter, Depends, Query
 
 from auth.tenancy import get_tenant_context, TenantContext
-from services.metrics_service import get_overview_metrics_service
+# routes/metrics_routes.py:7
+from services.dashboard_service import get_overview_metrics_service
 
 router = APIRouter(prefix="/api/metrics", tags=["metrics"])
 

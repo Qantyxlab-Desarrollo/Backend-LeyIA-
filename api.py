@@ -1,9 +1,7 @@
 #!/usr/bin/env python3
 # api.py — LeyIA Central (portal multi-tenant)
-# v3.1.0 — Auth central + tenancy + métricas por tenant (capa semantic v2)
-#          + refresco programado de matviews (b_mensajes/b_sesiones/b_clientes)
-# Un despliegue = TODOS los clientes.
-# SIN agente, SIN webhook WhatsApp (eso vive en agent_api.py, por cliente).
+# v3.1.1 — Auth central + tenancy + métricas (semantic + tablas base)
+#          + CORS dev regex + log con Origin
 
 import os
 import sys
@@ -63,38 +61,63 @@ def validate_startup() -> None:
 validate_startup()
 
 # ============================================================================
-# ROUTERS (todos consumen el servicio central)
+# ROUTERS
 # ============================================================================
 
-from auth.router import router as auth_router               # /me, /session, /logout
-from routes.admin_routes import router as admin_router      # provisión tenants/usuarios
+from auth.router import router as auth_router
+from routes.admin_routes import router as admin_router
 from routes.dashboard_routes import router as dashboard_router
 from routes.metrics_routes import router as metrics_router
-from routes.public_routes import router as public_router    # branding por tenant
+from routes.public_routes import router as public_router
 
 app = FastAPI(
     title="LeyIA Central",
-    version="3.1.0",
-    description="API central multi-tenant: identidad, autorización y métricas (capa semantic v2).",
+    version="3.1.1",
+    description="API central multi-tenant: identidad, autorización y métricas.",
 )
 
+# ============================================================================
+# CORS — dev con regex, prod con lista explícita
+# ============================================================================
+# Orígenes explícitos de producción (sin espacios, sin barra al final)
 ALLOWED_ORIGINS = [
-    settings.FRONTEND_URL,
     "https://frontend-ley-ia.vercel.app",
     "https://app.leyia.com",
-    "http://localhost:5173", "http://127.0.0.1:5173",
-    "http://localhost:3000", "http://127.0.0.1:3000",
 ]
+# Sumar FRONTEND_URL si existe y es válido (evita strings vacíos o con espacios)
+_frontend_url = (settings.FRONTEND_URL or "").strip().rstrip("/")
+if _frontend_url and _frontend_url not in ALLOWED_ORIGINS:
+    ALLOWED_ORIGINS.insert(0, _frontend_url)
 
+# En desarrollo aceptamos cualquier localhost/127.0.0.1 en cualquier puerto
+# (Vite arranca en 5173, pero si está ocupado pasa a 5174, 5175, …).
+DEV_ORIGIN_REGEX = r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$"
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+if settings.ENVIRONMENT == "development":
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origin_regex=DEV_ORIGIN_REGEX,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+        expose_headers=["*"],
+        max_age=600,
+    )
+    logger.info(f"🌐 CORS DEV: regex={DEV_ORIGIN_REGEX!r}")
+    logger.info(f"🌐 CORS DEV: allow_origins extra={ALLOWED_ORIGINS}")
+else:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=ALLOWED_ORIGINS,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+        expose_headers=["*"],
+        max_age=600,
+    )
+    logger.info(f"🌐 CORS PROD: {ALLOWED_ORIGINS}")
 
+# Routers
 app.include_router(auth_router)
 app.include_router(admin_router)
 app.include_router(dashboard_router)
@@ -111,7 +134,7 @@ def _list_api_routes() -> List[Dict[str, Any]]:
 
 
 # ============================================================================
-# MIDDLEWARE DE LOGGING
+# MIDDLEWARE DE LOGGING (con Origin)
 # ============================================================================
 
 @app.middleware("http")
@@ -119,7 +142,12 @@ async def log_requests(request: Request, call_next):
     start = time.time()
     client = request.client.host if request.client else "unknown"
     method, path = request.method, request.url.path
-    logger.info(f"➡️ {method} {path} | client={client}")
+    origin = request.headers.get("origin", "-")
+    acr_method = request.headers.get("access-control-request-method", "-")
+
+    logger.info(
+        f"➡️ {method} {path} | client={client} | origin={origin} | acr_method={acr_method}"
+    )
     try:
         response = await call_next(request)
         logger.info(
@@ -133,7 +161,7 @@ async def log_requests(request: Request, call_next):
 
 
 # ============================================================================
-# ENDPOINTS DE SISTEMA
+# ENDPOINTS DE SISTEMA / DEBUG
 # ============================================================================
 
 @app.get("/")
@@ -147,24 +175,46 @@ async def debug_routes():
     return {"total": len(routes), "routes": routes}
 
 
+@app.get("/api/debug/cors")
+async def debug_cors(request: Request):
+    """
+    Muestra la config CORS activa + el Origin de esta request.
+    Útil para verificar por qué un OPTIONS devuelve 400.
+    """
+    origin = request.headers.get("origin", "")
+    if settings.ENVIRONMENT == "development":
+        import re
+        allowed = bool(re.fullmatch(DEV_ORIGIN_REGEX, origin or ""))
+        return {
+            "mode": "development",
+            "regex": DEV_ORIGIN_REGEX,
+            "extra_origins": ALLOWED_ORIGINS,
+            "request_origin": origin or "(sin Origin)",
+            "matches_regex": allowed,
+            "would_pass": allowed or (origin in ALLOWED_ORIGINS),
+        }
+    return {
+        "mode": "production",
+        "allow_origins": ALLOWED_ORIGINS,
+        "request_origin": origin or "(sin Origin)",
+        "would_pass": origin in ALLOWED_ORIGINS,
+    }
+
+
 @app.get("/api/v1/system/status")
 async def system_status():
     return {
         "status": "ok",
         "service": "central",
-        "version": "3.1.0",
+        "version": "3.1.1",
         "environment": settings.ENVIRONMENT,
         "dev_bypass": settings.dev_tenant_bypass_enabled,
-        "capa_datos": "semantic v2 (b_mensajes/b_sesiones/b_clientes)",
-        "refresco_matviews": (
-            "loop_backend_dev" if settings.dev_tenant_bypass_enabled
-            else "pg_cron_o_admin_endpoint"
-        ),
+        "cors_mode": "regex" if settings.ENVIRONMENT == "development" else "list",
     }
 
 
 # ============================================================================
-# MANEJO DE ERRORES (500 sanitizado con error_id)
+# MANEJO DE ERRORES
 # ============================================================================
 
 @app.exception_handler(HTTPException)
@@ -201,7 +251,6 @@ async def lifespan(app: FastAPI):
     logger.info("=" * 70)
 
     if settings.dev_tenant_bypass_enabled:
-        # ---- Warm-up del pool del tenant demo ----
         async def _warmup():
             try:
                 from auth.tenancy import _dev_context
@@ -214,26 +263,18 @@ async def lifespan(app: FastAPI):
 
         asyncio.create_task(_warmup())
 
-        # ---- NUEVO: loop de refresco de matviews (solo entorno con bypass) ----
-        # En producción el refresco queda a cargo de pg_cron en la BD del tenant
-        # (recomendado) o del endpoint POST /api/dashboard/admin/refresh-matviews
-        # invocado por un scheduler externo.
         try:
             from auth.tenancy import _dev_context
             from services.mview_refresh_service import start_refresh_loop
             start_refresh_loop(_dev_context())
             logger.info("♻️ Loop de refresco de matviews INICIADO (dev)")
         except Exception as e:
-            logger.warning(f"⚠️ No se pudo iniciar el loop de refresco (no fatal): {e}")
+            logger.warning(f"⚠️ No se pudo iniciar el loop (no fatal): {e}")
     else:
-        logger.info(
-            "ℹ️ Refresco de matviews (producción): pg_cron por tenant "
-            "o POST /api/dashboard/admin/refresh-matviews"
-        )
+        logger.info("ℹ️ Refresco de matviews (producción): pg_cron por tenant")
 
     yield
 
-    # ---- Shutdown ordenado ----
     try:
         from services.mview_refresh_service import stop_refresh_loop
         await stop_refresh_loop()

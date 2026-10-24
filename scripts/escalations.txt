@@ -1,0 +1,40 @@
+-- ═══════════════════════════════════════════════════════════════
+-- ESCALAMIENTOS — capa semántica
+-- ═══════════════════════════════════════════════════════════════
+
+-- 0) LIMPIAR versiones previas en public (si existen)
+DROP VIEW IF EXISTS public.v_ultimos_escalamientos;
+DROP VIEW IF EXISTS public.v_escalamientos_hoy;
+
+-- 1) ÚLTIMOS REGISTROS (ordenada: más recientes primero)
+CREATE OR REPLACE VIEW semantic.v_ultimos_escalamientos AS
+SELECT
+    id,
+    created_at AT TIME ZONE 'America/Santiago' AS creado_cl,
+    CASE
+        WHEN summary IS NOT NULL AND length(trim(summary)) > 0
+            THEN summary || ' — solicitó contacto'
+        ELSE 'Cliente ' || left(lead_id::text, 8) || ' solicitó contacto'
+    END                                        AS mensaje,
+    motivo,
+    lead_id,
+    notificado_whatsapp
+FROM public.escalations                          -- ⚠️ tabla base, calificada
+ORDER BY created_at DESC;
+
+-- uso dashboard:
+-- SELECT creado_cl, mensaje FROM semantic.v_ultimos_escalamientos LIMIT 10;
+
+-- 2) ESCALAMIENTOS HOY (hora Chile)
+CREATE OR REPLACE VIEW semantic.v_escalamientos_hoy AS
+SELECT COUNT(*) AS total_hoy
+FROM public.escalations
+WHERE (created_at AT TIME ZONE 'America/Santiago')::date
+    = (NOW() AT TIME ZONE 'America/Santiago')::date;
+
+-- uso:
+-- SELECT total_hoy FROM semantic.v_escalamientos_hoy;
+
+-- 3) ÍNDICE (sobre la tabla base en public)
+CREATE INDEX IF NOT EXISTS idx_escalations_created_at
+    ON public.escalations (created_at DESC);

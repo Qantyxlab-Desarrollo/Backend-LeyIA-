@@ -27,6 +27,12 @@ TENANT_STATEMENT_TIMEOUT_MS = int(os.getenv("TENANT_STATEMENT_TIMEOUT_MS", "8000
 TENANT_CONNECT_TIMEOUT = int(os.getenv("TENANT_CONNECT_TIMEOUT", "5"))
 TENANT_COMMAND_TIMEOUT = float(os.getenv("TENANT_COMMAND_TIMEOUT", "15"))
 
+# search_path fijo — cubre tenant schemas (public + semantic).
+# Se aplica en el STARTUP PACKET de cada conexión física del pool, así que es
+# inmune al reordering de transaction pooler (Supabase :6543).
+# Si en el futuro aparece un tercer schema, agregarlo acá.
+TENANT_SEARCH_PATH = os.getenv("TENANT_SEARCH_PATH", "public, semantic")
+
 
 class TenantDSNError(Exception):
     pass
@@ -129,11 +135,23 @@ class TenantPoolManager:
                 dsn=dsn,
                 min_size=TENANT_POOL_MIN_SIZE,
                 max_size=TENANT_POOL_MAX_SIZE,
+                # statement_cache_size=0 es obligatorio con transaction pooler
+                # (evita prepared statements que el pooler no puede reutilizar).
                 statement_cache_size=0,
                 command_timeout=TENANT_COMMAND_TIMEOUT,
                 max_inactive_connection_lifetime=60,
                 max_queries=50_000,
-                server_settings={"application_name": f"leyia-tenant-{tenant_id[:8]}"},
+                # ⬇️⬇️ FIX: search_path se fija en el startup packet de cada
+                # conexión física. Inmune al reordering del transaction pooler.
+                # El antiguo `SET search_path TO {schema}` por query se aplicaba
+                # a una backend física y el fetch caía en otra → "relation X does
+                # not exist" intermitente (~2-3 de cada 10 requests).
+                server_settings={
+                    "application_name": f"leyia-tenant-{tenant_id[:8]}",
+                    "search_path": TENANT_SEARCH_PATH,
+                    # NOTA: NO setear default_transaction_read_only acá —
+                    # bloquearía REFRESH MATERIALIZED VIEW del loop de matviews.
+                },
             )
         except Exception as exc:
             logger.error(f"Fallo creando pool para tenant {tenant_id[:8]}: {exc}")
@@ -187,23 +205,6 @@ async def close_tenant_pools() -> None:
         logger.info("🛑 Tenant pools cerrados")
 
 
-# ── Setup/reset de conexión (solo lectura + search_path) ────────────────────
-async def _setup_connection(conn: asyncpg.Connection, schema: str) -> None:
-    await conn.execute("SET default_transaction_read_only = on")
-    await conn.execute(f"SET search_path TO {schema}, pg_catalog")
-
-
-async def _reset_connection(conn: asyncpg.Connection) -> None:
-    try:
-        await conn.execute("ROLLBACK")
-    except Exception:
-        pass
-    try:
-        await conn.execute("RESET ALL")
-    except Exception:
-        pass
-
-
 def _log_timing(label: str, query: str, dt_ms: float) -> None:
     resumen = " ".join(query.split())[:110]
     msg = f"⏱️ SQL-TENANT [{label}] {dt_ms:.0f}ms | {resumen}"
@@ -211,11 +212,20 @@ def _log_timing(label: str, query: str, dt_ms: float) -> None:
 
 
 # ── Ejecutores con retry ─────────────────────────────────────────────────
+# NOTA: ya NO hay _setup_connection / _reset_connection.
+#   • search_path viene del startup packet (server_settings en create_pool).
+#   • `async with pool.acquire()` hace ROLLBACK automático al liberar la
+#     conexión (PoolConnectionProxy.__aexit__ → Connection.reset()).
+#   • Eliminados los SET/RESET por query → ~3 round-trips menos por request
+#     en Supabase cross-region (≈450 ms de ahorro por query).
+# El parámetro `schema=` se mantiene por compatibilidad con los callers pero
+# ya no se usa (search_path = "public, semantic" cubre ambos).
+
 async def tenant_fetch_raw(
     tenant: TenantContext,
     query: str,
     *params,
-    schema: str = "semantic",
+    schema: str = "semantic",        # deprecated: ignorado (search_path global)
     label: str = "tenant_fetch",
 ) -> List[Record]:
     mgr = await get_tenant_manager()
@@ -225,7 +235,6 @@ async def tenant_fetch_raw(
 
     for intento in (1, 2):
         async with pool.acquire() as conn:
-            await _setup_connection(conn, schema)
             try:
                 result = await conn.fetch(query, *params)
                 _log_timing(label, query, (time.monotonic() - t0) * 1000)
@@ -235,8 +244,6 @@ async def tenant_fetch_raw(
                 logger.warning(f"🔌 [{label}] conexión inválida (intento {intento}/2): {e}")
             except Exception:
                 raise
-            finally:
-                await _reset_connection(conn)
 
     raise last_exc  # type: ignore[arg-type]
 
@@ -245,7 +252,7 @@ async def tenant_fetchrow_raw(
     tenant: TenantContext,
     query: str,
     *params,
-    schema: str = "semantic",
+    schema: str = "semantic",        # deprecated: ignorado
     label: str = "tenant_fetchrow",
 ) -> Optional[Record]:
     mgr = await get_tenant_manager()
@@ -255,7 +262,6 @@ async def tenant_fetchrow_raw(
 
     for intento in (1, 2):
         async with pool.acquire() as conn:
-            await _setup_connection(conn, schema)
             try:
                 result = await conn.fetchrow(query, *params)
                 _log_timing(label, query, (time.monotonic() - t0) * 1000)
@@ -265,8 +271,6 @@ async def tenant_fetchrow_raw(
                 logger.warning(f"🔌 [{label}] conexión inválida (intento {intento}/2): {e}")
             except Exception:
                 raise
-            finally:
-                await _reset_connection(conn)
 
     raise last_exc  # type: ignore[arg-type]
 
@@ -275,7 +279,7 @@ async def tenant_fetch(
     tenant: TenantContext,
     query: str,
     *params,
-    schema: str = "semantic",
+    schema: str = "semantic",        # deprecated: ignorado
     label: str = "tenant_fetch",
 ) -> List[Dict[str, Any]]:
     records = await tenant_fetch_raw(tenant, query, *params, schema=schema, label=label)
@@ -286,7 +290,7 @@ async def tenant_fetchrow(
     tenant: TenantContext,
     query: str,
     *params,
-    schema: str = "semantic",
+    schema: str = "semantic",        # deprecated: ignorado
     label: str = "tenant_fetchrow",
 ) -> Dict[str, Any]:
     record = await tenant_fetchrow_raw(tenant, query, *params, schema=schema, label=label)
