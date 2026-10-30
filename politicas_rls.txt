@@ -1,0 +1,12 @@
+--Asignar politica RLS
+
+
+ALTER TABLE public.conversations ENABLE ROW LEVEL SECURITY;
+
+-- Crítico si el rol de la app es el OWNER de la tabla:
+ALTER TABLE public.conversations FORCE ROW LEVEL SECURITY;
+
+CREATE POLICY tenant_isolation_conversations ON public.conversations
+  FOR SELECT
+  TO leyia_app
+  USING ( tenant_id = current_setting('app.tenant_id', true)::uuid );

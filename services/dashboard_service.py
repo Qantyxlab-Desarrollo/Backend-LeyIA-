@@ -14,7 +14,6 @@
 # Regla: el frontend PINTA. El backend CALCULA.
 # ============================================================================
 
-import asyncio
 import logging
 from datetime import date, datetime, timedelta
 from typing import Any, Dict, List, Optional
@@ -198,12 +197,12 @@ SQL_ESCALAMIENTOS_ULTIMOS = """
         notificado_whatsapp
     FROM semantic.v_ultimos_escalamientos
     LIMIT $1
-"""  # ⬅️ ACTUALIZADO: thread_id, telefono, nombre, correo
+"""
 
 SQL_ESCALAMIENTOS_HOY = """
     SELECT total_hoy, con_telefono_hoy, sin_telefono_hoy
     FROM semantic.v_escalamientos_hoy
-"""  # ⬅️ ACTUALIZADO: nuevas columnas de la vista v2
+"""
 
 SQL_ESCALAMIENTOS_TODOS = """
     SELECT
@@ -219,7 +218,7 @@ SQL_ESCALAMIENTOS_TODOS = """
         notificado_whatsapp
     FROM semantic.v_ultimos_escalamientos
     LIMIT $1 OFFSET $2
-"""  # ⬅️ ACTUALIZADO: misma estructura que /ultimos
+"""
 
 SQL_ESCALAMIENTOS_TODOS_COUNT = """
     SELECT COUNT(*)::int AS total
@@ -367,6 +366,7 @@ async def get_tasa_conversion_service(tenant: TenantContext, range_str: str = "7
         },
     }
 
+
 # ============================================================================
 # CITAS · DETALLE — vista semantic.v_citas_detalle
 # ============================================================================
@@ -410,6 +410,10 @@ async def get_citas_detalle_service(
 
     where_sql = " AND ".join(filtros)
 
+    # ── FIX 9: COUNT(*) OVER() — un solo acquire en vez de dos ────────────
+    # El total viaja pegado en cada fila. Se elimina el segundo round-trip
+    # (query_count) en el camino normal. Solo hay fallback al COUNT separado
+    # cuando `offset` cae más allá del último registro (rows == []).
     query = f"""
         SELECT
             booking_id, thread_id, conversation_id, lead_id, evento_id,
@@ -418,7 +422,8 @@ async def get_citas_detalle_service(
             fecha_cita_local, hora_inicio_local, hora_fin,
             meet_link, html_link, tiene_meet,
             duracion_seg_estimada,
-            inicio_cita, created_at
+            inicio_cita, created_at,
+            COUNT(*) OVER() AS total_count
         FROM semantic.v_citas_detalle
         WHERE {where_sql}
         ORDER BY {orden}
@@ -434,18 +439,24 @@ async def get_citas_detalle_service(
     key = f"citas_detalle_v2:{range_str}:{modo}:{modalidad or ''}:{canal or ''}:{limite}:{offset}"
 
     async def _load():
-        rows = await tenant_fetch_raw(
+        rows = _rows_to_dicts(await tenant_fetch_raw(
             tenant, query, *params_where, limite, offset,
             schema="semantic", label="citas_detalle_v2",
-        )
-        row_count = await tenant_fetchrow_raw(
-            tenant, query_count, *params_where,
-            schema="semantic", label="citas_detalle_v2_count",
-        )
-        return {
-            "rows": _rows_to_dicts(rows),
-            "total": (row_count or {}).get("total", 0),
-        }
+        ))
+        if rows:
+            # Extraer total del primer row y limpiar de todos.
+            total = int(rows[0].pop("total_count", 0) or 0)
+            for r in rows[1:]:
+                r.pop("total_count", None)
+        else:
+            # Offset fuera del último registro: COUNT(*) OVER() devolvió 0
+            # filas. Fallback al COUNT explícito (solo este edge case).
+            row_count = await tenant_fetchrow_raw(
+                tenant, query_count, *params_where,
+                schema="semantic", label="citas_detalle_v2_count",
+            )
+            total = int((_row_to_dict(row_count) or {}).get("total") or 0)
+        return {"rows": rows, "total": total}
 
     payload = await tenant_cache.get_or_set(tenant, key, _load)
 
@@ -466,7 +477,6 @@ async def get_citas_detalle_service(
         },
         "rows": payload["rows"],
     }
-
 
 
 # ============================================================================
@@ -602,11 +612,19 @@ async def get_escalamientos_hoy_service(tenant: TenantContext) -> Dict[str, Any]
     """
     Conteo de escalamientos del día (hora Chile).
     La vista retorna 1 fila siempre (COUNT = 0 si no hay).
+
+    FIX 8: cacheado. Card KPI del dashboard — 4-5 dupes por reload del front.
+    No requiere dato "live al segundo"; el feed live es /escalamientos/ultimos.
     """
-    row = _row_to_dict(await tenant_fetchrow_raw(
-        tenant, SQL_ESCALAMIENTOS_HOY,
-        schema="semantic", label="escalamientos_hoy",
-    )) or {}
+    key = "escalamientos_hoy:v1"
+
+    async def _load():
+        return _row_to_dict(await tenant_fetchrow_raw(
+            tenant, SQL_ESCALAMIENTOS_HOY,
+            schema="semantic", label="escalamientos_hoy",
+        )) or {}
+
+    row = await tenant_cache.get_or_set(tenant, key, _load)
 
     return {
         "fecha":            datetime.now(TZ_CL).date().isoformat(),
@@ -654,17 +672,16 @@ async def get_escalamientos_todos_service(
 
 
 # ============================================================================
-# OVERVIEW — 4 KPIs en paralelo
+# OVERVIEW — 4 KPIs (secuencial + caché del payload completo)
 # ============================================================================
-async def get_overview_metrics_service(tenant: TenantContext, range_str: str) -> Dict[str, Any]:
-    conv, ag, ttr, tasa = await asyncio.gather(
-        get_conversaciones_service(tenant, range_str),
-        get_agendas_service(tenant, range_str),
-        get_ttr_service(tenant, range_str),
-        get_tasa_conversion_service(tenant, range_str),
-    )
-
-    conv_subtitle    = f"{conv['conversaciones']} conversaciones únicas"
+def _build_overview_payload(
+    conv: Dict[str, Any],
+    ag:   Dict[str, Any],
+    ttr:  Dict[str, Any],
+    tasa: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Construye el payload final del overview. Función pura (testeable)."""
+    conv_subtitle = f"{conv['conversaciones']} conversaciones únicas"
     agendas_subtitle = (
         f"{ag['agendas']} citas registradas en el período"
         if ag["agendas"] > 0 else "Sin citas registradas"
@@ -697,6 +714,31 @@ async def get_overview_metrics_service(tenant: TenantContext, range_str: str) ->
         "agendas":        ag,
         "ttr":            ttr,
     }
+
+
+async def get_overview_metrics_service(tenant: TenantContext, range_str: str) -> Dict[str, Any]:
+    """
+    FIX 6: secuencial (no asyncio.gather). Con queries de 3-15ms, paralelizar
+    4 queries gana ~15ms pero consume 4 conexiones simultáneas del pool por
+    request. Secuencial = 1 conexión, 4 acquires secuenciales.
+
+    FIX 7: el payload final se cachea bajo 1 sola key. Los 4 requests
+    concurrentes del front (React StrictMode / polling mal deduplicado)
+    ejecutan el `_load` UNA vez; los otros 3 hacen cache hit instantáneo.
+    """
+    key = f"overview:v1:{range_str}"
+
+    async def _load():
+        # Secuencial. Cada `get_*_service` internamente ya tiene su propio
+        # cache (conv_total:7d, agendas_total:7d, …), así que si el overview
+        # fue invalidado pero esos no, los 4 calls son hits casi gratuitos.
+        conv = await get_conversaciones_service(tenant, range_str)
+        ag   = await get_agendas_service(tenant, range_str)
+        ttr  = await get_ttr_service(tenant, range_str)
+        tasa = await get_tasa_conversion_service(tenant, range_str)
+        return _build_overview_payload(conv, ag, ttr, tasa)
+
+    return await tenant_cache.get_or_set(tenant, key, _load)
 
 
 # ============================================================================
@@ -762,16 +804,24 @@ SQL_CONV_KPIS = """
 async def get_conv_por_dia_service(
     tenant: TenantContext, range_str: str = "30d",
 ) -> Dict[str, Any]:
-    """Conversaciones por día, pivoteadas por canal."""
+    """
+    Conversaciones por día, pivoteadas por canal.
+    FIX 8: cacheado por (range_str). Antes se ejecutaba 6 veces en 2 min
+    con la misma query — cada hit tomaba una conexión innecesarialmente.
+    """
     days  = RANGES.get(range_str, 30)
     hoy   = datetime.now(TZ_CL).date()
     desde = hoy - timedelta(days=days)
+    key   = f"conv_por_dia:v1:{range_str}"
 
-    rows = await tenant_fetch_raw(
-        tenant, SQL_CONV_POR_DIA, desde, hoy,
-        schema="semantic", label="conv_por_dia",
-    )
-    items = _rows_to_dicts(rows)
+    async def _load():
+        rows = await tenant_fetch_raw(
+            tenant, SQL_CONV_POR_DIA, desde, hoy,
+            schema="semantic", label="conv_por_dia",
+        )
+        return _rows_to_dicts(rows)
+
+    items = await tenant_cache.get_or_set(tenant, key, _load)
 
     # Pivote por fecha
     por_dia: Dict[str, Dict[str, Any]] = {}
@@ -797,11 +847,20 @@ async def get_conv_por_dia_service(
 
 
 async def get_conv_intenciones_service(tenant: TenantContext) -> Dict[str, Any]:
-    rows = await tenant_fetch_raw(
-        tenant, SQL_CONV_INTENCIONES,
-        schema="semantic", label="conv_intenciones",
-    )
-    items = _rows_to_dicts(rows)
+    """
+    Distribución de intenciones.
+    FIX 8: cacheado. Se ejecutaba 5 veces en 2 min.
+    """
+    key = "conv_intenciones:v1"
+
+    async def _load():
+        rows = await tenant_fetch_raw(
+            tenant, SQL_CONV_INTENCIONES,
+            schema="semantic", label="conv_intenciones",
+        )
+        return _rows_to_dicts(rows)
+
+    items = await tenant_cache.get_or_set(tenant, key, _load)
 
     # Consolidar por intent (ignorando el canal para el total principal)
     agg: Dict[str, Dict[str, Any]] = {}
@@ -823,11 +882,20 @@ async def get_conv_intenciones_service(tenant: TenantContext) -> Dict[str, Any]:
 
 
 async def get_conv_categorias_service(tenant: TenantContext) -> Dict[str, Any]:
-    rows = await tenant_fetch_raw(
-        tenant, SQL_CONV_CATEGORIAS,
-        schema="semantic", label="conv_categorias",
-    )
-    items = _rows_to_dicts(rows)
+    """
+    Distribución de categorías legales.
+    FIX 8: cacheado.
+    """
+    key = "conv_categorias:v1"
+
+    async def _load():
+        rows = await tenant_fetch_raw(
+            tenant, SQL_CONV_CATEGORIAS,
+            schema="semantic", label="conv_categorias",
+        )
+        return _rows_to_dicts(rows)
+
+    items = await tenant_cache.get_or_set(tenant, key, _load)
 
     agg: Dict[str, Dict[str, Any]] = {}
     for r in items:
@@ -848,11 +916,20 @@ async def get_conv_categorias_service(tenant: TenantContext) -> Dict[str, Any]:
 
 
 async def get_conv_status_service(tenant: TenantContext) -> Dict[str, Any]:
-    rows = await tenant_fetch_raw(
-        tenant, SQL_CONV_STATUS,
-        schema="semantic", label="conv_status",
-    )
-    items = _rows_to_dicts(rows)
+    """
+    Distribución por estado (open/closed/escalado/agendado).
+    FIX 8: cacheado.
+    """
+    key = "conv_status:v1"
+
+    async def _load():
+        rows = await tenant_fetch_raw(
+            tenant, SQL_CONV_STATUS,
+            schema="semantic", label="conv_status",
+        )
+        return _rows_to_dicts(rows)
+
+    items = await tenant_cache.get_or_set(tenant, key, _load)
     total = sum(r["total"] for r in items) or 1
     for r in items:
         r["pct"] = round(100.0 * r["total"] / total, 2)
@@ -860,10 +937,20 @@ async def get_conv_status_service(tenant: TenantContext) -> Dict[str, Any]:
 
 
 async def get_conv_kpis_service(tenant: TenantContext) -> Dict[str, Any]:
-    row = _row_to_dict(await tenant_fetchrow_raw(
-        tenant, SQL_CONV_KPIS,
-        schema="semantic", label="conv_kpis",
-    )) or {}
+    """
+    KPIs consolidados de conversaciones.
+    FIX 8: cacheado. Se ejecutaba 7 veces en 2 min (16s cada una por cola
+    de pool, no por SQL — el SQL tarda 1.8ms según pg_stat_statements).
+    """
+    key = "conv_kpis:v1"
+
+    async def _load():
+        return _row_to_dict(await tenant_fetchrow_raw(
+            tenant, SQL_CONV_KPIS,
+            schema="semantic", label="conv_kpis",
+        )) or {}
+
+    row = await tenant_cache.get_or_set(tenant, key, _load)
 
     return {
         "fecha_hoy": str(row.get("fecha_hoy") or ""),
