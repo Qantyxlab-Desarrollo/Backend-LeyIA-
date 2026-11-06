@@ -6,8 +6,11 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Path, Query  # + HTTPException, Path
 
 from auth.tenancy import get_tenant_context, TenantContext
+
+
 from services.dashboard_service import (
     get_conversaciones_service,
     get_agendas_service,
@@ -25,7 +28,10 @@ from services.dashboard_service import (
     get_conv_categorias_service,
     get_conv_status_service,
     get_conv_kpis_service,
+    get_conv_summary_service,
     health_semantic_service,
+    get_conv_threads_service,
+    get_conv_thread_detail_service,
 )
 
 router = APIRouter(prefix="/api/dashboard", tags=["dashboard"])
@@ -149,6 +155,31 @@ async def escalamientos_todos(
     return await get_escalamientos_todos_service(tenant, limite, offset)
 
 
+
+
+
+# ── CONVERSATIONS · SUMMARY (una sola request para toda la página) ────────
+@router.get("/conversations/summary", response_model=Dict[str, Any])
+async def conversations_summary(
+    range: str = Query("30d", pattern="^(7d|30d|90d)$"),
+    tenant: TenantContext = Depends(get_tenant_context),
+):
+    """
+    Payload consolidado para ConversationsPage.jsx.
+
+    Agrupa kpis + por-dia + intenciones + categorias + status en UNA sola
+    request HTTP con queries secuenciales internas.
+
+    Por qué existe: el front disparaba 5 fetches paralelos (× 2 en
+    StrictMode) → 10 requests simultáneas → pool max_size=10 agotado →
+    error 500 "Pool saturado" en las que llegaban al final. Con 1 request
+    + queries secuenciales, el consumo máximo cae a 1-2 conexiones.
+
+    Los 5 endpoints individuales siguen activos por compatibilidad con
+    cualquier otro consumidor (metrics_routes, scripts, Postman).
+    """
+    return await get_conv_summary_service(tenant, range)
+
 # ── CONVERSATIONS · ANALYTICS ─────────────────────────────────────────────
 @router.get("/conversations/kpis", response_model=Dict[str, Any])
 async def conversations_kpis(tenant: TenantContext = Depends(get_tenant_context)):
@@ -206,3 +237,33 @@ async def dashboard_status(tenant: TenantContext = Depends(get_tenant_context)):
         ],
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
+# ── CONVERSATIONS · HILO COMPLETO ───────────────────────────────────
+@router.get("/conversations/threads", response_model=Dict[str, Any])
+async def conversations_threads(
+    range: str = Query("30d", pattern="^(7d|30d|90d)$"),
+    status: Optional[str] = Query(None, pattern="^(open|closed|escalado|agendado)$"),
+    canal: Optional[str] = Query(None, pattern="^(whatsapp|web|cli|otro)$"),
+    q: Optional[str] = Query(None, min_length=2, max_length=120),
+    include_test: bool = Query(False),
+    limite: int = Query(20, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    tenant: TenantContext = Depends(get_tenant_context),
+):
+    """Bandeja: 1 fila por thread_id, con conteo de mensajes y preview."""
+    return await get_conv_threads_service(
+        tenant, range, status, canal, q, include_test, limite, offset
+    )
+
+
+@router.get("/conversations/threads/{thread_id}", response_model=Dict[str, Any])
+async def conversation_thread_detail(
+    thread_id: str = Path(..., min_length=1, max_length=200),
+    limite: int = Query(200, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
+    tenant: TenantContext = Depends(get_tenant_context),
+):
+    """Hilo completo: cabecera + mensajes ASC. Sin caché (live/polling)."""
+    result = await get_conv_thread_detail_service(tenant, thread_id, limite, offset)
+    if result is None:
+        raise HTTPException(status_code=404, detail=f"Thread '{thread_id}' no encontrado")
+    return result

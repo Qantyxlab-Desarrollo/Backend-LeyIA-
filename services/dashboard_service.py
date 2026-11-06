@@ -10,8 +10,14 @@
 #   • Escalamientos → semantic.v_ultimos_escalamientos / semantic.v_escalamientos_hoy
 #   • Conversaciones → semantic.v_conversations_por_dia / _por_intencion
 #                     / _por_categoria / _por_status / _kpis
+#   • Hilos          → semantic.v_conversation_threads / semantic.v_conversation_messages
 #
 # Regla: el frontend PINTA. El backend CALCULA.
+#
+# Normalización de datos crudos (verificado en diagnóstico):
+#   • conversations.channel: 'wa' + 'whatsapp' → 'whatsapp' · 'desconocido'/NULL → 'otro'
+#   • conversations.status:  'abierto' → 'open'
+#   • messages.role:         'human' → 'user' · 'ai' → 'assistant' (role_norm en la vista)
 # ============================================================================
 
 import logging
@@ -40,6 +46,22 @@ TZ_CL  = ZoneInfo("America/Santiago")
 # ============================================================================
 def _delta(actual: float, anterior: float) -> int:
     return round((actual - anterior) / anterior * 100) if anterior else 0
+
+
+def _canal_norm(channel: Optional[str]) -> str:
+    """Normaliza canal crudo → dominio del dashboard (whatsapp/web/cli/test/otro)."""
+    if channel in ("wa", "whatsapp"):
+        return "whatsapp"
+    if channel in ("web", "cli", "test"):
+        return channel
+    return "otro"   # 'desconocido', NULL, valores futuros
+
+
+def _status_norm(status: Optional[str]) -> str:
+    """Normaliza status crudo → dominio del dashboard (open/closed/escalado/agendado)."""
+    if status in (None, "abierto"):
+        return "open"
+    return status
 
 
 def _row_to_dict(row) -> Optional[Dict[str, Any]]:
@@ -808,6 +830,9 @@ async def get_conv_por_dia_service(
     Conversaciones por día, pivoteadas por canal.
     FIX 8: cacheado por (range_str). Antes se ejecutaba 6 veces en 2 min
     con la misma query — cada hit tomaba una conexión innecesarialmente.
+
+    ⬅️ Normalización: el pivote usa _canal_norm() para que 'wa' y 'whatsapp'
+    se fusionen en una sola serie 'whatsapp' (raw: 49 + 1 conversaciones).
     """
     days  = RANGES.get(range_str, 30)
     hoy   = datetime.now(TZ_CL).date()
@@ -832,10 +857,12 @@ async def get_conv_por_dia_service(
         if f_str not in por_dia:
             por_dia[f_str] = {"fecha": f_str, "total": 0, "por_canal": {}}
         por_dia[f_str]["total"] += r["total"]
-        por_dia[f_str]["por_canal"][r["channel"]] = (
-            por_dia[f_str]["por_canal"].get(r["channel"], 0) + r["total"]
+        # ⬅️ Normalizado + acumulado (raw podía traer 'wa' y 'whatsapp' por separado)
+        canal = _canal_norm(r["channel"])
+        por_dia[f_str]["por_canal"][canal] = (
+            por_dia[f_str]["por_canal"].get(canal, 0) + r["total"]
         )
-        canales_ord.add(r["channel"])
+        canales_ord.add(canal)
 
     return {
         "period":  range_str,
@@ -850,6 +877,7 @@ async def get_conv_intenciones_service(tenant: TenantContext) -> Dict[str, Any]:
     """
     Distribución de intenciones.
     FIX 8: cacheado. Se ejecutaba 5 veces en 2 min.
+    ⬅️ por_canal normalizado y acumulado con _canal_norm().
     """
     key = "conv_intenciones:v1"
 
@@ -871,7 +899,8 @@ async def get_conv_intenciones_service(tenant: TenantContext) -> Dict[str, Any]:
         agg[k]["total"]      += r["total"]
         agg[k]["total_30d"]  += r["total_30d"]
         agg[k]["total_hoy"]  += r["total_hoy"]
-        agg[k]["por_canal"][r["channel"]] = r["total"]
+        c = _canal_norm(r["channel"])
+        agg[k]["por_canal"][c] = agg[k]["por_canal"].get(c, 0) + r["total"]
 
     total = sum(v["total"] for v in agg.values()) or 1
     result = sorted(agg.values(), key=lambda x: x["total"], reverse=True)
@@ -885,6 +914,7 @@ async def get_conv_categorias_service(tenant: TenantContext) -> Dict[str, Any]:
     """
     Distribución de categorías legales.
     FIX 8: cacheado.
+    ⬅️ por_canal normalizado y acumulado con _canal_norm().
     """
     key = "conv_categorias:v1"
 
@@ -905,7 +935,8 @@ async def get_conv_categorias_service(tenant: TenantContext) -> Dict[str, Any]:
         agg[k]["total"]      += r["total"]
         agg[k]["total_30d"]  += r["total_30d"]
         agg[k]["total_hoy"]  += r["total_hoy"]
-        agg[k]["por_canal"][r["channel"]] = r["total"]
+        c = _canal_norm(r["channel"])
+        agg[k]["por_canal"][c] = agg[k]["por_canal"].get(c, 0) + r["total"]
 
     total = sum(v["total"] for v in agg.values()) or 1
     result = sorted(agg.values(), key=lambda x: x["total"], reverse=True)
@@ -919,6 +950,8 @@ async def get_conv_status_service(tenant: TenantContext) -> Dict[str, Any]:
     """
     Distribución por estado (open/closed/escalado/agendado).
     FIX 8: cacheado.
+    ⬅️ Normalización con FUSIÓN de buckets: 'abierto' se suma dentro de
+    'open', no basta con renombrar la etiqueta (raw: open=61 + abierto=30).
     """
     key = "conv_status:v1"
 
@@ -930,10 +963,18 @@ async def get_conv_status_service(tenant: TenantContext) -> Dict[str, Any]:
         return _rows_to_dicts(rows)
 
     items = await tenant_cache.get_or_set(tenant, key, _load)
-    total = sum(r["total"] for r in items) or 1
+
+    agg: Dict[str, int] = {}
     for r in items:
-        r["pct"] = round(100.0 * r["total"] / total, 2)
-    return {"total": total, "status": items}
+        k = _status_norm(r["status"])
+        agg[k] = agg.get(k, 0) + int(r["total"])
+
+    total = sum(agg.values()) or 1
+    status_list = [
+        {"status": k, "total": v, "pct": round(100.0 * v / total, 2)}
+        for k, v in sorted(agg.items(), key=lambda x: x[1], reverse=True)
+    ]
+    return {"total": total, "status": status_list}
 
 
 async def get_conv_kpis_service(tenant: TenantContext) -> Dict[str, Any]:
@@ -941,6 +982,11 @@ async def get_conv_kpis_service(tenant: TenantContext) -> Dict[str, Any]:
     KPIs consolidados de conversaciones.
     FIX 8: cacheado. Se ejecutaba 7 veces en 2 min (16s cada una por cola
     de pool, no por SQL — el SQL tarda 1.8ms según pg_stat_statements).
+
+    ⚠️ PENDIENTE: las columnas whatsapp/abiertas/etc. vienen precomputadas
+    de semantic.v_conversations_kpis. Si esa vista filtra channel='whatsapp'
+    o status='open' sin incluir 'wa'/'abierto', subcuenta — no es corregible
+    aquí, hay que ajustar el DDL de la vista.
     """
     key = "conv_kpis:v1"
 
@@ -971,4 +1017,249 @@ async def get_conv_kpis_service(tenant: TenantContext) -> Dict[str, Any]:
             "otros":    int(row.get("otros_canales") or 0),
         },
         "canales_unicos": int(row.get("canales_unicos") or 0),
+    }
+
+
+
+
+# ============================================================================
+# CONVERSATIONS · SUMMARY — 1 sola request, 1 conexión a la vez
+# ============================================================================
+async def get_conv_summary_service(
+    tenant: TenantContext,
+    range_str: str = "30d",
+) -> Dict[str, Any]:
+    """
+    Payload consolidado de la página ConversationsPage.
+
+    v2: se removió `intenciones` porque el panel "Intención detectada"
+    ya no se muestra en la UI. Se ahorra una query (~180ms exec) por
+    carga de página.
+
+    El endpoint INDIVIDUAL /conversations/intenciones sigue activo
+    (no se tocó el route, SQL, ni el service) — solo se dejó de llamar
+    desde acá.
+    """
+    key = f"conv_summary:v2:{range_str}"   # ⬅️ v1 → v2 = invalida cache al instante
+
+    async def _load():
+        kpis       = await get_conv_kpis_service(tenant)
+        por_dia    = await get_conv_por_dia_service(tenant, range_str)
+        categorias = await get_conv_categorias_service(tenant)
+        status     = await get_conv_status_service(tenant)
+        return {
+            "kpis":       kpis,
+            "por_dia":    por_dia,
+            "categorias": categorias,
+            "status":     status,
+        }
+
+    return await tenant_cache.get_or_set(tenant, key, _load)
+
+
+# ============================================================================
+# CONVERSATIONS · HILOS — listado paginado + detalle del hilo completo
+# ⬅️ NUEVO. Fuentes:
+#   • semantic.v_conversation_threads   (1 fila por thread_id, con stats y
+#                                        channel_norm/status_norm)
+#   • semantic.v_conversation_messages  (mensajes con role_norm, orden ASC)
+# ============================================================================
+SQL_CONV_THREADS_COUNT = """
+    SELECT COUNT(*)::int AS total
+    FROM semantic.v_conversation_threads
+    WHERE {where_sql}
+"""
+
+SQL_CONV_THREAD_HEAD = """
+    SELECT
+        conversation_id, thread_id,
+        channel, channel_norm, status, status_norm,
+        intent_first, category, summary,
+        fecha_creacion_local, created_at, updated_at, closed_at,
+        message_count, user_messages, assistant_messages,
+        first_message_at, last_message_at
+    FROM semantic.v_conversation_threads
+    WHERE thread_id = $1
+"""
+
+SQL_CONV_THREAD_MESSAGES = """
+    SELECT
+        message_id, role, role_norm, content, route,
+        intent, sentiment, urgency, category,
+        created_at,
+        COUNT(*) OVER() AS total_count
+    FROM semantic.v_conversation_messages
+    WHERE thread_id = $1
+    ORDER BY created_at ASC, message_id ASC
+    LIMIT $2 OFFSET $3
+"""
+
+SQL_CONV_THREAD_MESSAGES_COUNT = """
+    SELECT COUNT(*)::int AS total
+    FROM semantic.v_conversation_messages
+    WHERE thread_id = $1
+"""
+
+
+async def get_conv_threads_service(
+    tenant: TenantContext,
+    range_str: str = "30d",
+    status: Optional[str] = None,
+    canal: Optional[str] = None,
+    q: Optional[str] = None,
+    include_test: bool = False,
+    limite: int = 20,
+    offset: int = 0,
+) -> Dict[str, Any]:
+    """
+    Bandeja de conversaciones: 1 fila por thread_id, ordenada por última
+    actividad (last_message_at DESC). Cacheada (FIX 8) + COUNT(*) OVER() (FIX 9).
+
+    Los filtros `status` y `canal` se aplican sobre las columnas NORMALIZADAS
+    (status_norm / channel_norm), por eso los patterns de la ruta no cambian:
+    pedir canal=whatsapp trae tanto 'wa' como 'whatsapp'; status=open trae
+    también los 'abierto'.
+    """
+    limite = max(1, min(100, limite))
+    offset = max(0, offset)
+    days  = RANGES.get(range_str, 30)
+    hoy   = datetime.now(TZ_CL).date()
+    desde = hoy - timedelta(days=days)
+
+    filtros = ["fecha_creacion_local >= $1::date", "fecha_creacion_local <= $2::date"]
+    params: List[Any] = [desde, hoy]
+    p = 3
+
+    if not include_test:
+        filtros.append("channel IS DISTINCT FROM 'test'")
+    if status:
+        filtros.append(f"status_norm = ${p}")
+        params.append(status)
+        p += 1
+    if canal:
+        filtros.append(f"channel_norm = ${p}")
+        params.append(canal)
+        p += 1
+    if q:
+        filtros.append(f"(thread_id ILIKE ${p} OR summary ILIKE ${p})")
+        params.append(f"%{q}%")
+        p += 1
+
+    where_sql = " AND ".join(filtros)
+
+    query = f"""
+        SELECT
+            thread_id, conversation_id,
+            channel, channel_norm, status, status_norm,
+            intent_first, category, summary,
+            fecha_creacion_local, created_at, updated_at, closed_at,
+            message_count, user_messages, assistant_messages,
+            first_message_at, last_message_at,
+            last_message_preview, last_message_role,
+            COUNT(*) OVER() AS total_count
+        FROM semantic.v_conversation_threads
+        WHERE {where_sql}
+        ORDER BY last_message_at DESC NULLS LAST, created_at DESC
+        LIMIT ${p} OFFSET ${p + 1}
+    """
+    query_count = SQL_CONV_THREADS_COUNT.format(where_sql=where_sql)
+
+    key = f"conv_threads:v1:{range_str}:{status or ''}:{canal or ''}:{q or ''}:{include_test}:{limite}:{offset}"
+
+    async def _load():
+        rows = _rows_to_dicts(await tenant_fetch_raw(
+            tenant, query, *params, limite, offset,
+            schema="semantic", label="conv_threads",
+        ))
+        if rows:
+            total = int(rows[0].pop("total_count", 0) or 0)
+            for r in rows[1:]:
+                r.pop("total_count", None)
+        else:
+            # Offset fuera del último registro → fallback COUNT explícito (FIX 9)
+            row_count = await tenant_fetchrow_raw(
+                tenant, query_count, *params,
+                schema="semantic", label="conv_threads_count",
+            )
+            total = int((_row_to_dict(row_count) or {}).get("total") or 0)
+        return {"rows": rows, "total": total}
+
+    payload = await tenant_cache.get_or_set(tenant, key, _load)
+
+    return {
+        "period": range_str,
+        "inicio": desde.isoformat(),
+        "fin":    hoy.isoformat(),
+        "filtros": {
+            "status":       status or "all",
+            "canal":        canal or "all",
+            "q":            q or "",
+            "include_test": include_test,
+        },
+        "paginacion": {
+            "total":   payload["total"],
+            "limite":  limite,
+            "offset":  offset,
+            "paginas": (payload["total"] + limite - 1) // limite if limite > 0 else 0,
+        },
+        "rows": payload["rows"],
+    }
+
+
+async def get_conv_thread_detail_service(
+    tenant: TenantContext,
+    thread_id: str,
+    limite: int = 200,
+    offset: int = 0,
+) -> Optional[Dict[str, Any]]:
+    """
+    Hilo completo: cabecera (conversations) + mensajes ordenados ASC.
+
+    SIN caché a propósito (patrón escalamientos/ultimos): un thread 'open'
+    cambia en vivo y el front hará polling.
+
+    Retorna None si el thread no existe ni en conversations ni en messages
+    → la ruta lo traduce a 404. Si hay mensajes "huérfanos" sin fila en
+    conversations, responde con conversacion=None + mensajes (no 404).
+    """
+    limite = max(1, min(1000, limite))
+    offset = max(0, offset)
+
+    head = _row_to_dict(await tenant_fetchrow_raw(
+        tenant, SQL_CONV_THREAD_HEAD, thread_id,
+        schema="semantic", label="conv_thread_head",
+    ))
+
+    mensajes = _rows_to_dicts(await tenant_fetch_raw(
+        tenant, SQL_CONV_THREAD_MESSAGES, thread_id, limite, offset,
+        schema="semantic", label="conv_thread_messages",
+    ))
+
+    if mensajes:
+        total_msgs = int(mensajes[0].pop("total_count", 0) or 0)
+        for r in mensajes[1:]:
+            r.pop("total_count", None)
+    elif offset > 0:
+        # offset fuera de rango → COUNT(*) OVER() devolvió 0 filas (fallback FIX 9)
+        row_count = await tenant_fetchrow_raw(
+            tenant, SQL_CONV_THREAD_MESSAGES_COUNT, thread_id,
+            schema="semantic", label="conv_thread_messages_count",
+        )
+        total_msgs = int((_row_to_dict(row_count) or {}).get("total") or 0)
+    else:
+        total_msgs = 0
+
+    if head is None and total_msgs == 0:
+        return None
+
+    return {
+        "thread_id":    thread_id,
+        "conversacion": head,
+        "paginacion": {
+            "total":   total_msgs,
+            "limite":  limite,
+            "offset":  offset,
+            "paginas": (total_msgs + limite - 1) // limite if limite > 0 else 0,
+        },
+        "mensajes": mensajes,
     }
